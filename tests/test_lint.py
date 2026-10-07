@@ -32,6 +32,8 @@ def codes(sql: str) -> set[str]:
         ("SS014", "CREATE NONCLUSTERED INDEX ix ON t (a);"),
         ("SS015", "SELECT * FROM t WITH (NOLOCK);"),
         ("SS016", "EXEC sp_executesql @sql;"),
+        ("SS017", "BEGIN TRAN;"),
+        ("SS017", "COMMIT TRAN;"),
         ("SS018", "PRINT 'hello';"),
         ("SS019", "SELECT DATEADD(mm, 1, d);"),
         ("SS020", "CREATE TYPE BudgetRows AS TABLE (id INT);"),
@@ -48,6 +50,8 @@ def test_each_error_rule_fires(code, sql):
         ("SS104", "SELECT LEN(name) FROM t;"),
         ("SS105", "TRUNCATE TABLE t;"),
         ("SS106", "MERGE INTO t USING s ON t.id = s.id;"),
+        ("SS107", "v_id := (SELECT MAX(JournalID) FROM j WHERE t = 'A');"),
+        ("SS107", "SELECT MAX(OrderID) INTO :v_id FROM orders;"),
     ],
 )
 def test_each_warning_rule_fires(code, sql):
@@ -112,6 +116,10 @@ class TestFalsePositives:
     def test_timestamp_ntz_is_not_flagged_as_datetime(self):
         assert "SS011" not in codes("CREATE TABLE t (c TIMESTAMP_NTZ);")
 
+    def test_spelled_out_begin_transaction_is_valid_snowflake(self):
+        # Required inside scripting blocks; only the T-SQL "TRAN" is foreign.
+        assert "SS017" not in codes("BEGIN TRANSACTION;")
+
 
 class TestSeverityFiltering:
     def test_info_rules_are_excluded_by_default(self):
@@ -140,3 +148,14 @@ class TestOutput:
         parsed = json.loads(format_findings(lint_text("SELECT GETDATE();"), "json"))
         assert parsed[0]["code"] == "SS001"
         assert parsed[0]["line"] == 1
+
+
+class TestIdReadBack:
+    """SS107 targets assigning MAX(id) to a variable, not every MAX()."""
+
+    def test_reporting_max_is_not_flagged(self):
+        assert "SS107" not in codes("SELECT MAX(JournalID) AS last_id FROM j;")
+
+    def test_max_of_non_id_column_is_not_flagged(self):
+        assert "SS107" not in codes("v_total := (SELECT MAX(Amount) FROM t);")
+

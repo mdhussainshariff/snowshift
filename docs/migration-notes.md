@@ -193,10 +193,33 @@ returning `VARIANT` via `OBJECT_CONSTRUCT` rather than output parameters.
 | Output parameters | a single `VARIANT` return value |
 | `@variable` | `v_variable`, referenced as `:v_variable` |
 
-`MERGE` carried over but is not equivalent: Snowflake raises an error when a
-source row matches multiple target rows, where SQL Server picks one
-nondeterministically. This is stricter and better, but it will surface latent
-duplicate-key bugs on first run. Rule `SS106` flags every `MERGE` for review.
+None of the procedures use `MERGE`. Rule `SS106` still flags any that appear:
+Snowflake raises an error when one target row matches several source rows,
+where SQL Server picks one nondeterministically.
+
+The duplicate-key risk that does apply here is the unenforced constraints
+described [above](#constraints). Two procedures depended on SQL Server
+rejecting duplicates and were changed to check for themselves:
+
+- **`usp_BulkImportBudgetData`** relied on the natural-key `UNIQUE` on
+  `BudgetLineItem`. It now rejects keys repeated within a payload, and handles
+  lines that already exist according to `DUPLICATE_HANDLING`: `REJECT` refuses
+  them, `UPDATE` overwrites them. Without this, running an import twice would
+  double the budget. (The converted procedure also never resolved the
+  payload's account, cost center and period codes to IDs, so it imported
+  nothing at all. That is fixed too.)
+- **`usp_ExecuteCostAllocation`** and **`usp_ProcessBudgetConsolidation`**
+  read back the new journal's ID with `MAX(JournalID)`, standing in for
+  `SCOPE_IDENTITY()`. That returns the wrong journal once two runs overlap,
+  and `AUTOINCREMENT` is not guaranteed to be ordered. Their journal numbers
+  were also only unique to the second. Each run now gets a journal number with
+  a random suffix (`ALLOC-20260101120000-1a2b3c4d`) and is read back by that
+  number. Header and lines are written in a single transaction. Rule `SS107`
+  flags the `MAX(...ID)` read-back pattern.
+
+The remaining exposure is concurrency: two imports into the same budget at the
+same moment can both pass the existence check. SQL Server's constraint caught
+that; nothing in Snowflake does short of serialising the imports.
 
 ---
 

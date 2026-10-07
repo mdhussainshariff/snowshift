@@ -88,9 +88,11 @@ RULES: tuple[Rule, ...] = (
     _r("SS016", r"\bsp_executesql\b|\bEXEC\s*\(",
        "sp_executesql / EXEC() dynamic SQL is T-SQL only.",
        "Use EXECUTE IMMEDIATE inside a Snowflake Scripting block."),
-    _r("SS017", r"\bBEGIN\s+TRAN(?:SACTION)?\b",
-       "BEGIN TRANSACTION is spelled differently.",
-       "Use BEGIN TRANSACTION only inside scripting blocks; otherwise rely on autocommit."),
+    # BEGIN TRANSACTION itself is valid Snowflake, and inside a scripting block
+    # it is the required spelling; only the T-SQL abbreviation is not.
+    _r("SS017", r"\b(?:BEGIN|COMMIT|ROLLBACK)\s+TRAN\b",
+       "TRAN is a T-SQL abbreviation.",
+       "Spell it out: BEGIN TRANSACTION, COMMIT, ROLLBACK."),
     _r("SS018", r"\bPRINT\s+",
        "PRINT has no Snowflake equivalent.",
        "Return the value, or RAISE a notice from a scripting block."),
@@ -125,6 +127,12 @@ RULES: tuple[Rule, ...] = (
     _r("SS106", r"\bMERGE\b",
        "MERGE semantics differ on multi-match rows.",
        "Snowflake errors on multiple source matches unless ERROR_ON_NONDETERMINISTIC_MERGE=FALSE.",
+       severity="warning"),
+    # The usual stand-in for SCOPE_IDENTITY(). It returns another session's row
+    # once two runs overlap, and AUTOINCREMENT is not guaranteed to be ordered.
+    _r("SS107", r":=\s*\(\s*SELECT\s+MAX\s*\(\s*[\w.]*ID\s*\)|\bSELECT\s+MAX\s*\(\s*[\w.]*ID\s*\)\s+INTO\b",
+       "Reading back a generated ID with MAX() is not safe.",
+       "Write a value unique to this run (e.g. with UUID_STRING()) and look the row up by it.",
        severity="warning"),
 )
 

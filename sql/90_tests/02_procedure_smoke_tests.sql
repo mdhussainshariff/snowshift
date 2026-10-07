@@ -11,6 +11,14 @@ Prerequisites:
 1. snowshift deploy --through 50_procedures (schema created)
 2. snowshift deploy --only 60_seed (data loaded)
 
+Every test asserts on what the procedure did and RAISEs when it is wrong, so
+a failure fails the deploy run and halts the remaining tests. Each block is
+wrapped in EXECUTE IMMEDIATE $$ ... $$ because the connector's execute_string
+cannot split a bare DECLARE ... BEGIN ... END block.
+
+The sample budget is looked up by BudgetCode: its BudgetHeaderID is assigned by
+AUTOINCREMENT and is not guaranteed to be 1.
+
 
 ================================================================================
 TEST SETUP - Verify Schema and Data
@@ -21,14 +29,14 @@ USE WAREHOUSE MIGRATION_WH;
 USE DATABASE SNOWCONVERT_DEMO;
 USE SCHEMA Planning;
 
-SELECT '=== FINAL TEST SUITE - WITH TESTSAMPLE DATA ===' AS StartMessage;
+SELECT '=== PROCEDURE SMOKE TESTS - WITH TESTSAMPLE DATA ===' AS StartMessage;
 
 
 
 -- Verify TestSample data exists
 SELECT '=== DATA VERIFICATION ===' AS Phase;
 
-SELECT 
+SELECT
     'FiscalPeriod' AS Table_Name,
     COUNT(*) AS Record_Count
 FROM Planning.FiscalPeriod
@@ -53,19 +61,38 @@ ORDER BY Table_Name;
 TEST 1: usp_BulkImportBudgetData
 ================================================================================
 
-Tests: Bulk import with actual TestSample data structure
-Input: JSON sample budget data
-Output: Import results, row counts, validation
+1a  Import three lines with UPDATE handling. The seed is random, so these keys
+    may or may not already exist; UPDATE gives the same end state either way:
+    exactly one line per key, carrying the imported amounts.
+1b  Re-import the same payload with REJECT. Every row must be rejected and the
+    budget must not grow -- the regression test for the unenforced natural-key
+    UNIQUE constraint.
+1c  Unknown codes and a key repeated within the payload are all rejected.
 */
 
 SELECT '=== TEST 1: BULK IMPORT DATA ===' AS TestCase;
 
--- Prepare test JSON using actual data structure from TestSample
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_test_json VARIANT;
-    v_import_results VARIANT;
+    v_budget_id INT;
+    v_payload VARIANT;
+    v_result VARIANT;
+    v_imported INT;
+    v_rejected INT;
+    v_lines_before INT;
+    v_lines_after INT;
+    v_matching_lines INT;
+    v_final_amount DECIMAL(19,4);
+    EX_FIRST_IMPORT EXCEPTION (-20901, 'TEST 1a failed: expected all 3 rows imported and none rejected');
+    EX_NOT_ONE_LINE_PER_KEY EXCEPTION (-20902, 'TEST 1a failed: expected exactly one budget line per imported key');
+    EX_WRONG_AMOUNT EXCEPTION (-20903, 'TEST 1a failed: FinalAmount for 4000/OPS is not original plus adjusted');
+    EX_RERUN_NOT_REJECTED EXCEPTION (-20904, 'TEST 1b failed: re-import with REJECT should reject all 3 rows');
+    EX_RERUN_DUPLICATED EXCEPTION (-20905, 'TEST 1b failed: re-import changed the number of budget lines');
+    EX_BAD_ROWS_ACCEPTED EXCEPTION (-20906, 'TEST 1c failed: unknown codes and in-payload duplicates should all be rejected');
 BEGIN
-    v_test_json := PARSE_JSON('[
+    v_budget_id := (SELECT BudgetHeaderID FROM Planning.BudgetHeader WHERE BudgetCode = 'BUDGET-2024-001');
+
+    v_payload := PARSE_JSON('[
         {
             "account_number": "4000",
             "cost_center_code": "OPS",
@@ -98,306 +125,346 @@ BEGIN
         }
     ]');
 
+    -- 1a
     CALL Planning.usp_BulkImportBudgetData(
-        'VARIANT',
-        1,
-        NULL,
-        :v_test_json,
-        NULL,
-        'LENIENT',
-        'REJECT',
-        10000,
-        TRUE
-    ) INTO :v_import_results;
-    
-    SELECT 
-        'TEST 1: Bulk Import Data' AS TestName,
-        'PASSED' AS Status,
-        :v_import_results:rows_imported AS RowsImported,
-        :v_import_results:rows_rejected AS RowsRejected,
-        'JSON import processed successfully' AS Result,
-        :v_import_results AS ImportMetadata;
+        'VARIANT', :v_budget_id, NULL, :v_payload, NULL, 'LENIENT', 'UPDATE', 10000, TRUE
+    ) INTO :v_result;
+
+    v_imported := (SELECT :v_result:rows_imported::INT);
+    v_rejected := (SELECT :v_result:rows_rejected::INT);
+    IF (v_imported <> 3 OR v_rejected <> 0) THEN
+        RAISE EX_FIRST_IMPORT;
+    END IF;
+
+    v_matching_lines := (
+        SELECT COUNT(*)
+        FROM Planning.BudgetLineItem bli
+        JOIN Planning.GLAccount ga ON bli.GLAccountID = ga.GLAccountID
+        JOIN Planning.CostCenter cc ON bli.CostCenterID = cc.CostCenterID
+        JOIN Planning.FiscalPeriod fp ON bli.FiscalPeriodID = fp.FiscalPeriodID
+        WHERE bli.BudgetHeaderID = :v_budget_id
+        AND fp.FiscalYear = 2024
+        AND fp.FiscalMonth = 4
+        AND ga.AccountNumber || '/' || cc.CostCenterCode IN ('4000/OPS', '5000/SALES', '5200/HR')
+    );
+    IF (v_matching_lines <> 3) THEN
+        RAISE EX_NOT_ONE_LINE_PER_KEY;
+    END IF;
+
+    v_final_amount := (
+        SELECT bli.FinalAmount
+        FROM Planning.BudgetLineItem bli
+        JOIN Planning.GLAccount ga ON bli.GLAccountID = ga.GLAccountID
+        JOIN Planning.CostCenter cc ON bli.CostCenterID = cc.CostCenterID
+        JOIN Planning.FiscalPeriod fp ON bli.FiscalPeriodID = fp.FiscalPeriodID
+        WHERE bli.BudgetHeaderID = :v_budget_id
+        AND fp.FiscalYear = 2024
+        AND fp.FiscalMonth = 4
+        AND ga.AccountNumber = '4000'
+        AND cc.CostCenterCode = 'OPS'
+    );
+    IF (v_final_amount IS NULL OR v_final_amount <> 183500) THEN
+        RAISE EX_WRONG_AMOUNT;
+    END IF;
+
+    -- 1b
+    v_lines_before := (SELECT COUNT(*) FROM Planning.BudgetLineItem WHERE BudgetHeaderID = :v_budget_id);
+
+    CALL Planning.usp_BulkImportBudgetData(
+        'VARIANT', :v_budget_id, NULL, :v_payload, NULL, 'LENIENT', 'REJECT', 10000, TRUE
+    ) INTO :v_result;
+
+    v_imported := (SELECT :v_result:rows_imported::INT);
+    v_rejected := (SELECT :v_result:rows_rejected::INT);
+    IF (v_imported <> 0 OR v_rejected <> 3) THEN
+        RAISE EX_RERUN_NOT_REJECTED;
+    END IF;
+
+    v_lines_after := (SELECT COUNT(*) FROM Planning.BudgetLineItem WHERE BudgetHeaderID = :v_budget_id);
+    IF (v_lines_after <> v_lines_before) THEN
+        RAISE EX_RERUN_DUPLICATED;
+    END IF;
+
+    -- 1c
+    v_payload := PARSE_JSON('[
+        {"account_number": "9999", "cost_center_code": "OPS",   "fiscal_year": 2024, "fiscal_month": 5, "original_amount": 1000.00},
+        {"account_number": "4000", "cost_center_code": "SALES", "fiscal_year": 2024, "fiscal_month": 5, "original_amount": 2000.00},
+        {"account_number": "4000", "cost_center_code": "SALES", "fiscal_year": 2024, "fiscal_month": 5, "original_amount": 3000.00}
+    ]');
+
+    CALL Planning.usp_BulkImportBudgetData(
+        'VARIANT', :v_budget_id, NULL, :v_payload, NULL, 'LENIENT', 'UPDATE', 10000, TRUE
+    ) INTO :v_result;
+
+    v_imported := (SELECT :v_result:rows_imported::INT);
+    v_rejected := (SELECT :v_result:rows_rejected::INT);
+    v_lines_after := (SELECT COUNT(*) FROM Planning.BudgetLineItem WHERE BudgetHeaderID = :v_budget_id);
+    IF (v_imported <> 0 OR v_rejected <> 3 OR v_lines_after <> v_lines_before) THEN
+        RAISE EX_BAD_ROWS_ACCEPTED;
+    END IF;
+
+    RETURN 'TEST 1 passed: import, re-import rejection and bad-row rejection';
 END;
-
---DROP TABLE IF EXISTS temp_import_staging;
-
--- Verify imported data
-SELECT 
-    ' TEST 1 Verification: New Budget Lines' AS Check_data,
-    COUNT(*) AS TotalBudgetLines,
-    COUNT(DISTINCT GLAccountID) AS UniqueAccounts,
-    COUNT(DISTINCT CostCenterID) AS UniqueCostCenters,
-    SUM(OriginalAmount) AS TotalOriginal,
-    SUM(AdjustedAmount) AS TotalAdjusted,
-    SUM(FinalAmount) AS TotalFinal
-FROM Planning.BudgetLineItem
-WHERE BudgetHeaderID = 1;
+$$;
 
 /*
 ================================================================================
 TEST 2: usp_ExecuteCostAllocation
 ================================================================================
 
-Tests: Allocation rule execution with TestSample hierarchy
-Input: Budget ID 1, HEADCOUNT basis (from TestSample rules)
-Output: Rules processed, consolidation lines created
+Exactly one new journal, its ID returned by the procedure, holding one line per
+budget line and totalling what the procedure reports as allocated.
 */
 
 SELECT '=== TEST 2: COST ALLOCATION ===' AS TestCase;
 
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_allocation_results VARIANT;
+    v_budget_id INT;
+    v_result VARIANT;
+    v_journal_id INT;
+    v_journals_before INT;
+    v_journals_after INT;
+    v_expected_lines INT;
+    v_actual_lines INT;
+    v_line_total DECIMAL(19,4);
+    v_reported_total DECIMAL(19,4);
+    EX_NO_JOURNAL EXCEPTION (-20911, 'TEST 2 failed: procedure did not return the journal it created');
+    EX_JOURNAL_COUNT EXCEPTION (-20912, 'TEST 2 failed: expected exactly one new allocation journal');
+    EX_LINE_COUNT EXCEPTION (-20913, 'TEST 2 failed: journal lines do not match the budget lines');
+    EX_LINE_TOTAL EXCEPTION (-20914, 'TEST 2 failed: journal line total does not match total_allocated');
 BEGIN
-    CALL Planning.usp_ExecuteCostAllocation(
-        1,
-        'HEADCOUNT',
-        FALSE,
-        FALSE
-    ) INTO :v_allocation_results;
-    
-    SELECT 
-        ' TEST 2: Cost Allocation' AS TestName,
-        'PASSED' AS Status,
-        :v_allocation_results:rules_processed AS RulesProcessed,
-        :v_allocation_results:allocated_amount AS TotalAllocated,
-        COALESCE(:v_allocation_results:errors::VARCHAR, 'No errors - allocation successful') AS Status_Message,
-        :v_allocation_results AS AllocationMetadata;
-END;
+    v_budget_id := (SELECT BudgetHeaderID FROM Planning.BudgetHeader WHERE BudgetCode = 'BUDGET-2024-001');
+    v_journals_before := (
+        SELECT COUNT(*) FROM Planning.ConsolidationJournal
+        WHERE BudgetHeaderID = :v_budget_id AND JournalType = 'ALLOCATION'
+    );
 
--- Verify allocation results
-SELECT 
-    ' TEST 2 Verification: Allocation Results' AS Check_data,
-    COUNT(*) AS ConsolidationLines,
-    COUNT(DISTINCT JournalID) AS JournalsCreated,
-    SUM(CASE WHEN DebitAmount > 0 THEN DebitAmount ELSE 0 END) AS TotalDebits,
-    SUM(CASE WHEN CreditAmount > 0 THEN CreditAmount ELSE 0 END) AS TotalCredits
-FROM Planning.ConsolidationJournalLine
-WHERE CreatedDateTime >= CURRENT_TIMESTAMP() - INTERVAL '5 minutes';
+    CALL Planning.usp_ExecuteCostAllocation(:v_budget_id, 'HEADCOUNT', FALSE, FALSE) INTO :v_result;
+
+    v_journal_id := (SELECT :v_result:journal_id::INT);
+    IF (v_journal_id IS NULL) THEN
+        RAISE EX_NO_JOURNAL;
+    END IF;
+
+    v_journals_after := (
+        SELECT COUNT(*) FROM Planning.ConsolidationJournal
+        WHERE BudgetHeaderID = :v_budget_id AND JournalType = 'ALLOCATION'
+    );
+    IF (v_journals_after <> v_journals_before + 1) THEN
+        RAISE EX_JOURNAL_COUNT;
+    END IF;
+
+    v_expected_lines := (SELECT COUNT(*) FROM Planning.BudgetLineItem WHERE BudgetHeaderID = :v_budget_id);
+    v_actual_lines := (SELECT COUNT(*) FROM Planning.ConsolidationJournalLine WHERE JournalID = :v_journal_id);
+    IF (v_actual_lines <> v_expected_lines) THEN
+        RAISE EX_LINE_COUNT;
+    END IF;
+
+    v_line_total := (SELECT COALESCE(SUM(NetAmount), 0) FROM Planning.ConsolidationJournalLine WHERE JournalID = :v_journal_id);
+    v_reported_total := (SELECT :v_result:total_allocated::DECIMAL(19,4));
+    IF (v_line_total <> v_reported_total) THEN
+        RAISE EX_LINE_TOTAL;
+    END IF;
+
+    RETURN 'TEST 2 passed: one journal, ' || v_actual_lines || ' lines, total ' || v_line_total;
+END;
+$$;
 
 /*
 ================================================================================
 TEST 3: usp_GenerateRollingForecast
 ================================================================================
 
-Tests: Forecast generation with TestSample periods
-Input: Base budget 1, 12-month forecast, 3.5% growth
-Output: Forecast budget created, periods generated
+The procedure is still a placeholder: it counts periods and adds a flat 100000
+per period without writing anything. This only pins the period count.
 */
 
 SELECT '=== TEST 3: ROLLING FORECAST ===' AS TestCase;
 
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_forecast_results VARIANT;
+    v_budget_id INT;
+    v_result VARIANT;
+    v_periods INT;
+    EX_PERIOD_COUNT EXCEPTION (-20921, 'TEST 3 failed: expected 12 forecast periods');
 BEGIN
-    CALL Planning.usp_GenerateRollingForecast(
-        1,
-        12,
-        2024,
-        1,
-        3.5,
-        'SEASONAL_FACTORS',
-        TRUE
-    ) INTO :v_forecast_results;
-    
-    SELECT 
-        ' TEST 3: Rolling Forecast' AS TestName,
-        'PASSED' AS Status,
-        :v_forecast_results:periods_generated AS PeriodsGenerated,
-        :v_forecast_results:total_forecast_amount AS TotalForecastAmount,
-        'Forecast with 3.5% growth rate applied' AS ForecastType,
-        :v_forecast_results AS ForecastMetadata;
-END;
+    v_budget_id := (SELECT BudgetHeaderID FROM Planning.BudgetHeader WHERE BudgetCode = 'BUDGET-2024-001');
 
--- Verify forecast was created
-SELECT 
-    ' TEST 3 Verification: Forecast Budget' AS Check_data,
-    BudgetType,
-    COUNT(*) AS BudgetCount,
-    COUNT(DISTINCT FiscalPeriodID) AS PeriodsCovered,
-    SUM(CASE WHEN bli.BudgetHeaderID IS NOT NULL THEN 1 ELSE 0 END) AS LineItemsGenerated
-FROM Planning.BudgetHeader bh
-LEFT JOIN Planning.BudgetLineItem bli ON bh.BudgetHeaderID = bli.BudgetHeaderID
-WHERE bh.BudgetType IN ('FORECAST', 'ROLLING')
-GROUP BY BudgetType;
+    CALL Planning.usp_GenerateRollingForecast(
+        :v_budget_id, 12, 2024, 1, 3.5, 'SEASONAL_FACTORS', TRUE
+    ) INTO :v_result;
+
+    v_periods := (SELECT :v_result:periods_generated::INT);
+    IF (v_periods IS NULL OR v_periods <> 12) THEN
+        RAISE EX_PERIOD_COUNT;
+    END IF;
+
+    RETURN 'TEST 3 passed: 12 periods (procedure is a placeholder)';
+END;
+$$;
 
 /*
 ================================================================================
 TEST 4: usp_PerformFinancialClose
 ================================================================================
 
-Tests: Period close with TestSample periods
-Input: Period 1 (January 2024), close level PERIOD
-Output: Period locked, audit trail created
+Closing January 2024 must lock the period and mark its budget lines allocated.
+
+validate_only is not tested: the procedure currently ignores it and closes the
+period regardless.
 */
 
 SELECT '=== TEST 4: FINANCIAL CLOSE ===' AS TestCase;
 
--- Get test period
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_test_period_id INT;
-    v_close_results VARIANT;
+    v_period_id INT;
+    v_result VARIANT;
+    v_is_closed BOOLEAN;
+    v_unallocated INT;
+    EX_NO_PERIOD EXCEPTION (-20930, 'TEST 4 failed: no fiscal period for January 2024');
+    EX_NOT_CLOSED EXCEPTION (-20931, 'TEST 4 failed: period is not closed after close');
+    EX_NOT_ALLOCATED EXCEPTION (-20932, 'TEST 4 failed: budget lines in the closed period are not marked allocated');
 BEGIN
-    SELECT FiscalPeriodID INTO :v_test_period_id FROM Planning.FiscalPeriod 
-        WHERE FiscalYear = 2024 AND FiscalMonth = 1 LIMIT 1;
+    v_period_id := (SELECT FiscalPeriodID FROM Planning.FiscalPeriod WHERE FiscalYear = 2024 AND FiscalMonth = 1);
+    IF (v_period_id IS NULL) THEN
+        RAISE EX_NO_PERIOD;
+    END IF;
 
-    SELECT 'Period ID selected: ' || :v_test_period_id::VARCHAR AS PeriodInfo;
+    CALL Planning.usp_PerformFinancialClose(:v_period_id, 'PERIOD', FALSE, FALSE) INTO :v_result;
 
-    CALL Planning.usp_PerformFinancialClose(
-        :v_test_period_id,
-        'PERIOD',
-        TRUE,
-        FALSE
-    ) INTO :v_close_results;
-    
-    SELECT 
-        ' TEST 4A: Period Validation' AS TestName,
-        'PASSED' AS Status,
-        'Validation successful' AS ValidationResult,
-        :v_close_results AS ValidationDetails;
+    v_is_closed := (SELECT IsClosed FROM Planning.FiscalPeriod WHERE FiscalPeriodID = :v_period_id);
+    IF (NOT COALESCE(v_is_closed, FALSE)) THEN
+        RAISE EX_NOT_CLOSED;
+    END IF;
+
+    v_unallocated := (
+        SELECT COUNT(*) FROM Planning.BudgetLineItem
+        WHERE FiscalPeriodID = :v_period_id AND IsAllocated = FALSE
+    );
+    IF (v_unallocated <> 0) THEN
+        RAISE EX_NOT_ALLOCATED;
+    END IF;
+
+    RETURN 'TEST 4 passed: period ' || v_period_id || ' closed';
 END;
-
-DECLARE
-    v_test_period_id2 INT;
-    v_close_results2 VARIANT;
-BEGIN
-    SELECT FiscalPeriodID INTO :v_test_period_id2 FROM Planning.FiscalPeriod 
-        WHERE FiscalYear = 2024 AND FiscalMonth = 1 LIMIT 1;
-
-    SELECT 
-        ' TEST 4: Period Status Before Close' AS Check_data,
-        FiscalPeriodID,
-        PeriodName,
-        IsClosed,
-        ClosedDateTime
-    FROM Planning.FiscalPeriod 
-    WHERE FiscalPeriodID = :v_test_period_id2;
-
-    CALL Planning.usp_PerformFinancialClose(
-        :v_test_period_id2,
-        'PERIOD',
-        FALSE,
-        FALSE
-    ) INTO :v_close_results2;
-    
-    SELECT 
-        ' TEST 4B: Period Close Executed' AS TestName,
-        'PASSED' AS Status,
-        'Period has been closed' AS CloseResult,
-        :v_close_results2 AS CloseDetails;
-
-    SELECT 
-        ' TEST 4: Period Status After Close' AS Check_data,
-        FiscalPeriodID,
-        PeriodName,
-        IsClosed,
-        ClosedDateTime,
-        CASE WHEN IsClosed = TRUE THEN 'LOCKED' ELSE 'OPEN' END AS PeriodStatus
-    FROM Planning.FiscalPeriod 
-    WHERE FiscalPeriodID = :v_test_period_id2;
-
-    SELECT 
-        ' TEST 4: Budget Lines Status' AS Check_data,
-        COUNT(*) AS TotalBudgetLines,
-        SUM(CASE WHEN IsAllocated = TRUE THEN 1 ELSE 0 END) AS AllocatedLines,
-        SUM(CASE WHEN IsAllocated = FALSE THEN 1 ELSE 0 END) AS UnallocatedLines
-    FROM Planning.BudgetLineItem
-    WHERE FiscalPeriodID = :v_test_period_id2;
-END;
+$$;
 
 /*
 ================================================================================
 TEST 5: usp_ProcessBudgetConsolidation
 ================================================================================
 
-Tests: Budget consolidation with TestSample data
-Input: Budget ID 1, FULL consolidation, eliminate intercompany
-Output: Consolidated lines, eliminated amounts
+Exactly one new journal, its ID returned by the procedure, holding one line per
+budget line on an active cost center.
 */
 
 SELECT '=== TEST 5: BUDGET CONSOLIDATION ===' AS TestCase;
 
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_elimination_results VARIANT;
+    v_budget_id INT;
+    v_result VARIANT;
+    v_journal_id INT;
+    v_journals_before INT;
+    v_journals_after INT;
+    v_expected_lines INT;
+    v_actual_lines INT;
+    v_reported_lines INT;
+    EX_NO_JOURNAL EXCEPTION (-20941, 'TEST 5 failed: procedure did not return the journal it created');
+    EX_JOURNAL_COUNT EXCEPTION (-20942, 'TEST 5 failed: expected exactly one new consolidation journal');
+    EX_LINE_COUNT EXCEPTION (-20943, 'TEST 5 failed: journal lines do not match the active-cost-center budget lines');
 BEGIN
-    CALL Planning.usp_ProcessBudgetConsolidation(
-        1,
-        'FULL',
-        TRUE
-    ) INTO :v_elimination_results;
-    
-    SELECT 
-        ' TEST 5: Budget Consolidation' AS TestName,
-        'PASSED' AS Status,
-        'Full consolidation with IC elimination' AS ConsolidationType,
-        :v_elimination_results AS ConsolidationMetadata;
-END;
+    v_budget_id := (SELECT BudgetHeaderID FROM Planning.BudgetHeader WHERE BudgetCode = 'BUDGET-2024-001');
+    v_journals_before := (
+        SELECT COUNT(*) FROM Planning.ConsolidationJournal
+        WHERE BudgetHeaderID = :v_budget_id AND JournalType = 'CONSOLIDATION'
+    );
 
--- Verify consolidation results
-SELECT 
-    ' TEST 5 Verification: Consolidation Summary' AS Check_data,
-    COUNT(*) AS ConsolidationJournals,
-    SUM(CASE WHEN IsBalanced = TRUE THEN 1 ELSE 0 END) AS BalancedJournals,
-    SUM(CASE WHEN IsBalanced = FALSE THEN 1 ELSE 0 END) AS UnbalancedJournals,
-    COUNT(DISTINCT (SELECT COUNT(*) FROM Planning.ConsolidationJournalLine WHERE JournalID = cj.JournalID)) AS JournalLinesTotal
-FROM Planning.ConsolidationJournal cj
-WHERE BudgetHeaderID = 1;
+    CALL Planning.usp_ProcessBudgetConsolidation(:v_budget_id, 'FULL', TRUE) INTO :v_result;
+
+    v_journal_id := (SELECT :v_result:journal_id::INT);
+    IF (v_journal_id IS NULL) THEN
+        RAISE EX_NO_JOURNAL;
+    END IF;
+
+    v_journals_after := (
+        SELECT COUNT(*) FROM Planning.ConsolidationJournal
+        WHERE BudgetHeaderID = :v_budget_id AND JournalType = 'CONSOLIDATION'
+    );
+    IF (v_journals_after <> v_journals_before + 1) THEN
+        RAISE EX_JOURNAL_COUNT;
+    END IF;
+
+    v_expected_lines := (
+        SELECT COUNT(*)
+        FROM Planning.BudgetLineItem bli
+        JOIN Planning.CostCenter cc ON bli.CostCenterID = cc.CostCenterID AND cc.IsActive = TRUE
+        WHERE bli.BudgetHeaderID = :v_budget_id
+    );
+    v_actual_lines := (SELECT COUNT(*) FROM Planning.ConsolidationJournalLine WHERE JournalID = :v_journal_id);
+    v_reported_lines := (SELECT :v_result:consolidated_lines::INT);
+    IF (v_actual_lines <> v_expected_lines OR v_reported_lines <> v_actual_lines) THEN
+        RAISE EX_LINE_COUNT;
+    END IF;
+
+    RETURN 'TEST 5 passed: one journal, ' || v_actual_lines || ' lines';
+END;
+$$;
 
 /*
 ================================================================================
 TEST 6: usp_ReconcileIntercompanyBalances
 ================================================================================
 
-Tests: Intercompany reconciliation with TestSample data
-Input: Period 1, tolerance 0.01, fiscal year 2024
-Output: Reconciliation results, variance detection
+The procedure does not match or eliminate yet; it counts the intercompany lines
+in the period. This pins that count.
 */
 
 SELECT '=== TEST 6: INTERCOMPANY RECONCILIATION ===' AS TestCase;
 
--- Get test period
+EXECUTE IMMEDIATE $$
 DECLARE
-    v_reconcile_period INT;
-    v_reconcile_results VARIANT;
+    v_period_id INT;
+    v_result VARIANT;
+    v_expected INT;
+    v_reported INT;
+    EX_COUNT EXCEPTION (-20951, 'TEST 6 failed: reconciled_count does not match the intercompany lines in the period');
 BEGIN
-    SELECT FiscalPeriodID INTO :v_reconcile_period FROM Planning.FiscalPeriod 
-        WHERE FiscalYear = 2024 AND FiscalMonth = 1 LIMIT 1;
+    v_period_id := (SELECT FiscalPeriodID FROM Planning.FiscalPeriod WHERE FiscalYear = 2024 AND FiscalMonth = 1);
 
-    CALL Planning.usp_ReconcileIntercompanyBalances(
-        :v_reconcile_period,
-        0.01,
-        2024,
-        FALSE
-    ) INTO :v_reconcile_results;
-    
-    SELECT 
-        ' TEST 6: Intercompany Reconciliation' AS TestName,
-        'PASSED' AS Status,
-        'IC transactions matched with 1-cent tolerance' AS ReconciliationType,
-        :v_reconcile_results AS ReconciliationMetadata;
+    CALL Planning.usp_ReconcileIntercompanyBalances(:v_period_id, 0.01, 2024, FALSE) INTO :v_result;
 
-    SELECT 
-        ' TEST 6 Verification: IC Transaction Summary' AS Check_data,
-        COUNT(*) AS ICTransactionCount,
-        COUNT(DISTINCT ga.GLAccountID) AS UniqueICAccounts,
-        SUM(OriginalAmount) AS TotalICAmount,
-        MIN(OriginalAmount) AS MinAmount,
-        MAX(OriginalAmount) AS MaxAmount
-    FROM Planning.BudgetLineItem bli
-    JOIN Planning.GLAccount ga ON bli.GLAccountID = ga.GLAccountID
-    WHERE ga.IntercompanyFlag = TRUE
-    AND bli.FiscalPeriodID = :v_reconcile_period;
+    v_expected := (
+        SELECT COUNT(*)
+        FROM Planning.BudgetLineItem bli
+        JOIN Planning.GLAccount ga ON bli.GLAccountID = ga.GLAccountID
+        WHERE ga.IntercompanyFlag = TRUE
+        AND bli.FiscalPeriodID = :v_period_id
+    );
+    v_reported := (SELECT :v_result:reconciled_count::INT);
+    IF (v_reported IS NULL OR v_reported <> v_expected) THEN
+        RAISE EX_COUNT;
+    END IF;
+
+    RETURN 'TEST 6 passed: ' || v_reported || ' intercompany lines';
 END;
+$$;
 
 /*
 ================================================================================
-FINAL COMPREHENSIVE SUMMARY
+SUMMARY
 ================================================================================
+
+Reaching this point means every assertion above held: a failing test raises
+and halts the run. The queries below are informational only.
 */
 
-SELECT '=== ALL PROCEDURE TESTS COMPLETE ===' AS FinalStatus;
+SELECT '=== ALL PROCEDURE TESTS PASSED ===' AS FinalStatus;
 
 -- Final data summary
-SELECT 
+SELECT
     'FINAL DATA SUMMARY' AS Category,
     'Fiscal Periods' AS Item,
     COUNT(*)::VARCHAR AS Value
@@ -416,24 +483,10 @@ UNION ALL
 SELECT 'FINAL DATA SUMMARY', 'Consolidation Journals', COUNT(*)::VARCHAR FROM Planning.ConsolidationJournal
 UNION ALL
 SELECT 'FINAL DATA SUMMARY', 'Consolidation Lines', COUNT(*)::VARCHAR FROM Planning.ConsolidationJournalLine
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 1: Bulk Import', ' PASSED'
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 2: Cost Allocation', ' PASSED'
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 3: Rolling Forecast', ' PASSED'
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 4: Financial Close', ' PASSED'
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 5: Budget Consolidation', ' PASSED'
-UNION ALL
-SELECT 'TEST RESULTS', 'TEST 6: IC Reconciliation', ' PASSED'
-UNION ALL
-SELECT 'FINAL STATUS', 'Overall Result', ' ALL TESTS PASSED '
 ORDER BY Category, Item;
 
 -- Show comprehensive budget analysis
-SELECT 
+SELECT
     'BUDGET ANALYSIS WITH TESTSAMPLE DATA' AS ResultType,
     bh.BudgetCode,
     bh.BudgetName,
@@ -445,12 +498,12 @@ SELECT
     ROUND(SUM(bli.FinalAmount) / NULLIF(SUM(bli.OriginalAmount), 0), 4) AS FinalToOriginalRatio
 FROM Planning.BudgetLineItem bli
 JOIN Planning.BudgetHeader bh ON bli.BudgetHeaderID = bh.BudgetHeaderID
-WHERE bh.BudgetHeaderID = 1
+WHERE bh.BudgetCode = 'BUDGET-2024-001'
 GROUP BY bh.BudgetCode, bh.BudgetName
 ORDER BY bh.BudgetCode;
 
 -- Show cost center allocation summary
-SELECT 
+SELECT
     'COST CENTER HIERARCHY SUMMARY' AS Summary,
     cc.CostCenterCode,
     cc.CostCenterName,
@@ -465,9 +518,9 @@ GROUP BY cc.CostCenterCode, cc.CostCenterName, parent.CostCenterCode
 ORDER BY cc.CostCenterCode;
 
 -- Show GL Account distribution
-SELECT 
+SELECT
     'GL ACCOUNT DISTRIBUTION' AS Summary,
-    CASE 
+    CASE
         WHEN ga.AccountType = 'R' THEN 'Revenue'
         WHEN ga.AccountType = 'X' THEN 'Expense'
         WHEN ga.AccountType = 'A' THEN 'Asset'
@@ -478,9 +531,10 @@ SELECT
     SUM(CASE WHEN bli.FiscalPeriodID IS NOT NULL THEN 1 ELSE 0 END) AS BudgetedAccounts,
     SUM(COALESCE(bli.FinalAmount, 0)) AS TotalBudgetAmount
 FROM Planning.GLAccount ga
-LEFT JOIN Planning.BudgetLineItem bli ON ga.GLAccountID = bli.GLAccountID AND bli.BudgetHeaderID = 1
+LEFT JOIN Planning.BudgetHeader bh ON bh.BudgetCode = 'BUDGET-2024-001'
+LEFT JOIN Planning.BudgetLineItem bli ON ga.GLAccountID = bli.GLAccountID AND bli.BudgetHeaderID = bh.BudgetHeaderID
 WHERE ga.IsActive = TRUE
-GROUP BY CASE 
+GROUP BY CASE
             WHEN ga.AccountType = 'R' THEN 'Revenue'
             WHEN ga.AccountType = 'X' THEN 'Expense'
             WHEN ga.AccountType = 'A' THEN 'Asset'
@@ -488,8 +542,3 @@ GROUP BY CASE
             WHEN ga.AccountType = 'E' THEN 'Equity'
          END
 ORDER BY AccountCategory;
-
-SELECT '════════════════════════════════════════════════════════════════' AS Separator;
-SELECT 'STATUS: ALL PROCEDURES TESTED SUCCESSFULLY WITH TESTSAMPLE.SQL DATA' AS FinalMessage;
-SELECT 'SYSTEM IS PRODUCTION READY ' AS DeploymentStatus;
-SELECT '════════════════════════════════════════════════════════════════' AS EndSeparator;

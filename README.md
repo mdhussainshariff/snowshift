@@ -40,7 +40,7 @@ snowshift/
 ├── src/snowshift/
 │   ├── cli.py              ←   the three subcommands
 │   ├── lint/
-│   │   ├── rules.py        ←   26 dialect rules, each with a Snowflake fix
+│   │   ├── rules.py        ←   27 dialect rules, each with a Snowflake fix
 │   │   └── linter.py       ←   comment-aware scanner with noqa support
 │   ├── deploy/
 │   │   ├── manifest.py     ←   manifest parsing + stage selection
